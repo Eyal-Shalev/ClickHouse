@@ -8,7 +8,6 @@ from pathlib import Path
 
 from github import Github
 
-from clickhouse_helper import ClickHouseHelper, prepare_tests_results_for_clickhouse
 from commit_status_helper import (
     RerunHelper,
     get_commit,
@@ -19,11 +18,9 @@ from docker_images_helper import get_docker_image, pull_image
 from env_helper import TEMP_PATH, REPO_COPY
 from get_robot_token import get_best_robot_token
 from pr_info import PRInfo
-from report import TestResults, TestResult
-from s3_helper import S3Helper
+from report import JobReport, TestResults, TestResult
 from stopwatch import Stopwatch
 from tee_popen import TeePopen
-from upload_result_helper import upload_results
 
 
 NAME = "Docs Check"
@@ -134,28 +131,15 @@ def main():
         else:
             test_results.append(TestResult("Non zero exit code", "FAIL"))
 
-    s3_helper = S3Helper()
-    ch_helper = ClickHouseHelper()
+    JobReport(
+        description=description,
+        test_results=test_results,
+        status=status,
+        start_time=stopwatch.start_time_str,
+        duration=stopwatch.duration_seconds,
+        additional_files=additional_files,
+    ).dump()
 
-    report_url = upload_results(
-        s3_helper, pr_info.number, pr_info.sha, test_results, additional_files, NAME
-    )
-    print("::notice ::Report url: {report_url}")
-    post_commit_status(
-        commit, status, report_url, description, NAME, pr_info, dump_to_file=True
-    )
-
-    prepared_events = prepare_tests_results_for_clickhouse(
-        pr_info,
-        test_results,
-        status,
-        stopwatch.duration_seconds,
-        stopwatch.start_time_str,
-        report_url,
-        NAME,
-    )
-
-    ch_helper.insert_events_into(db="default", table="checks", events=prepared_events)
     if status == "failure":
         sys.exit(1)
 

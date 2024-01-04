@@ -1,4 +1,5 @@
 import argparse
+import ast
 import concurrent.futures
 import json
 import os
@@ -14,17 +15,35 @@ from commit_status_helper import (
     CommitStatusData,
     format_description,
     get_commit,
+    post_commit_status,
     set_status_comment,
 )
 from digest_helper import DockerDigester, JobDigester
-from env_helper import CI, REPORT_PATH, ROOT_DIR, S3_BUILDS_BUCKET, TEMP_PATH
+from env_helper import (
+    CI,
+    GITHUB_JOB_API_URL,
+    REPO_COPY,
+    REPORT_PATH,
+    ROOT_DIR,
+    S3_BUILDS_BUCKET,
+    TEMP_PATH,
+)
 from get_robot_token import get_best_robot_token
 from git_helper import GIT_PREFIX, Git
 from git_helper import Runner as GitRunner
 from github import Github
 from pr_info import PRInfo
-from report import BuildResult
+from report import BuildResult, JobReport
 from s3_helper import S3Helper
+from clickhouse_helper import (
+    CiLogsCredentials,
+    ClickHouseHelper,
+    get_instance_id,
+    get_instance_type,
+    prepare_tests_results_for_clickhouse,
+)
+from build_check import get_release_or_pr
+import upload_result_helper
 from version_helper import get_version_from_repo
 
 
@@ -148,6 +167,11 @@ def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="will create run config without skipping build jobs in any case, used in --configure action (for release branches)",
+    )
+    parser.add_argument(
+        "--commit-message",
+        default="",
+        help="debug option to test commit message processing",
     )
     return parser.parse_args()
 
@@ -539,6 +563,197 @@ def _fetch_commit_tokens(message: str) -> List[str]:
     return res
 
 
+def _upload_build_artifacts(
+    pr_info: PRInfo,
+    build_name: str,
+    build_digest: str,
+    job_report: JobReport,
+    s3: S3Helper,
+    s3_destination: str,
+) -> str:
+    # There are ugly artifacts for the performance test. FIXME:
+    s3_performance_path = "/".join(
+        (
+            get_release_or_pr(pr_info, get_version_from_repo())[1],
+            pr_info.sha,
+            CI_CONFIG.normalize_string(build_name),
+            "performance.tar.zst",
+        )
+    )
+    performance_urls = []
+    assert job_report.dir_for_upload, "Must be set for build job"
+    performance_path = Path(job_report.dir_for_upload) / "performance.tar.zst"
+    if performance_path.exists():
+        performance_urls.append(
+            s3.upload_build_file_to_s3(performance_path, s3_performance_path)
+        )
+        print(
+            "Uploaded performance.tar.zst to %s, now delete to avoid duplication",
+            performance_urls[0],
+        )
+        performance_path.unlink()
+    build_urls = (
+        s3.upload_build_directory_to_s3(
+            Path(job_report.dir_for_upload),
+            s3_destination,
+            keep_dirs_in_s3_path=False,
+            upload_symlinks=False,
+        )
+        + performance_urls
+    )
+    print("::notice ::Build URLs: {}".format("\n".join(build_urls)))
+    log_path = Path(job_report.additional_files[0])
+    log_url = ""
+    if log_path.exists():
+        log_url = s3.upload_build_file_to_s3(
+            log_path, s3_destination + "/" + log_path.name
+        )
+    print(f"::notice ::Log URL: {log_url}")
+
+    # generate and upload build report
+    build_result = BuildResult(
+        build_name,
+        log_url,
+        build_urls,
+        job_report.description,  # version.describe
+        ast.literal_eval(job_report.status),
+        int(job_report.duration),
+        GITHUB_JOB_API_URL(),
+    )
+    result_json_path = build_result.write_json(Path(TEMP_PATH))
+    s3_path = get_s3_path(build_digest) + result_json_path.name
+    build_report_url = s3.upload_file(
+        bucket=S3_BUILDS_BUCKET, file_path=result_json_path, s3_path=s3_path
+    )
+    print(f"Report file [{result_json_path}] has been uploaded to [{build_report_url}]")
+
+    # Upload head master binaries
+    static_bin_name = CI_CONFIG.build_config[build_name].static_binary_name
+    if pr_info.is_master() and static_bin_name:
+        # Full binary with debug info:
+        s3_path_full = "/".join((pr_info.base_ref, static_bin_name, "clickhouse-full"))
+        binary_full = Path(job_report.dir_for_upload) / "clickhouse"
+        url_full = s3.upload_build_file_to_s3(binary_full, s3_path_full)
+        print(f"::notice ::Binary static URL (with debug info): {url_full}")
+
+        # Stripped binary without debug info:
+        s3_path_compact = "/".join((pr_info.base_ref, static_bin_name, "clickhouse"))
+        binary_compact = Path(job_report.dir_for_upload) / "clickhouse-stripped"
+        url_compact = s3.upload_build_file_to_s3(binary_compact, s3_path_compact)
+        print(f"::notice ::Binary static URL (compact): {url_compact}")
+
+    return log_url
+
+
+def _upload_build_profile_data(
+    pr_info: PRInfo,
+    build_name: str,
+    job_report: JobReport,
+    git_runner: GitRunner,
+    ch_helper: ClickHouseHelper,
+) -> None:
+    ci_logs_credentials = CiLogsCredentials(Path("/dev/null"))
+    if ci_logs_credentials.host:
+        instance_type = get_instance_type()
+        instance_id = get_instance_id()
+        query = f"""INSERT INTO build_time_trace
+            (
+                pull_request_number,
+                commit_sha,
+                check_start_time,
+                check_name,
+                instance_type,
+                instance_id,
+                file,
+                library,
+                time,
+                pid,
+                tid,
+                ph,
+                ts,
+                dur,
+                cat,
+                name,
+                detail,
+                count,
+                avgMs,
+                args_name
+            )
+            SELECT {pr_info.number}, '{pr_info.sha}', '{job_report.start_time}', '{build_name}', '{instance_type}', '{instance_id}', *
+            FROM input('
+                file String,
+                library String,
+                time DateTime64(6),
+                pid UInt32,
+                tid UInt32,
+                ph String,
+                ts UInt64,
+                dur UInt64,
+                cat String,
+                name String,
+                detail String,
+                count UInt64,
+                avgMs UInt64,
+                args_name String')
+            FORMAT JSONCompactEachRow"""
+
+        auth = {
+            "X-ClickHouse-User": "ci",
+            "X-ClickHouse-Key": ci_logs_credentials.password,
+        }
+        url = f"https://{ci_logs_credentials.host}/"
+        profiles_dir = Path(TEMP_PATH) / "profiles_source"
+        profiles_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            "Processing profile JSON files from %s",
+            Path(REPO_COPY) / "build_docker",
+        )
+        git_runner(
+            "./utils/prepare-time-trace/prepare-time-trace.sh "
+            f"build_docker {profiles_dir.absolute()}"
+        )
+        profile_data_file = Path(TEMP_PATH) / "profile.json"
+        with open(profile_data_file, "wb") as profile_fd:
+            for profile_source in profiles_dir.iterdir():
+                if profile_source.name != "binary_sizes.txt":
+                    with open(profiles_dir / profile_source, "rb") as ps_fd:
+                        profile_fd.write(ps_fd.read())
+
+        print(
+            "::notice ::Log Uploading profile data, path: %s, size: %s, query: %s",
+            profile_data_file,
+            profile_data_file.stat().st_size,
+            query,
+        )
+        ch_helper.insert_file(url, auth, query, profile_data_file)
+
+        query = f"""INSERT INTO binary_sizes
+            (
+                pull_request_number,
+                commit_sha,
+                check_start_time,
+                check_name,
+                instance_type,
+                instance_id,
+                file,
+                size
+            )
+            SELECT {pr_info.number}, '{pr_info.sha}', '{job_report.start_time}', '{build_name}', '{instance_type}', '{instance_id}', file, size
+            FROM input('size UInt64, file String')
+            SETTINGS format_regexp = '^\\s*(\\d+) (.+)$'
+            FORMAT Regexp"""
+
+        binary_sizes_file = profiles_dir / "binary_sizes.txt"
+
+        print(
+            "::notice ::Log Uploading binary sizes data, path: %s, size: %s, query: %s",
+            binary_sizes_file,
+            binary_sizes_file.stat().st_size,
+            query,
+        )
+        ch_helper.insert_file(url, auth, query, binary_sizes_file)
+
+
 def main() -> int:
     exit_code = 0
     parser = argparse.ArgumentParser(
@@ -561,23 +776,25 @@ def main() -> int:
 
     result: Dict[str, Any] = {}
     s3 = S3Helper()
+    pr_info = PRInfo()
+    git_runner = GitRunner(set_cwd_to_git_root=True)
 
+    ### CONFIGURE action: start
     if args.configure:
-        GR = GitRunner()
-        pr_info = PRInfo()
-
         docker_data = {}
-        git_ref = GR.run(f"{GIT_PREFIX} rev-parse HEAD")
+        git_ref = git_runner.run(f"{GIT_PREFIX} rev-parse HEAD")
 
         # if '#no-merge-commit' is set in commit message - set git ref to PR branch head to avoid merge-commit
         tokens = []
-        if pr_info.number != 0 and not args.skip_jobs:
-            message = GR.run(f"{GIT_PREFIX} log {pr_info.sha} --format=%B -n 1")
+        if (pr_info.number != 0 and not args.skip_jobs) or args.commit_message:
+            message = args.commit_message or git_runner.run(
+                f"{GIT_PREFIX} log {pr_info.sha} --format=%B -n 1"
+            )
             tokens = _fetch_commit_tokens(message)
             print(f"Found commit message tokens: [{tokens}]")
             if "#no-merge-commit" in tokens and CI:
-                GR.run(f"{GIT_PREFIX} checkout {pr_info.sha}")
-                git_ref = GR.run(f"{GIT_PREFIX} rev-parse HEAD")
+                git_runner.run(f"{GIT_PREFIX} checkout {pr_info.sha}")
+                git_ref = git_runner.run(f"{GIT_PREFIX} rev-parse HEAD")
                 print(
                     "#no-merge-commit is set in commit message - Setting git ref to PR branch HEAD to not use merge commit"
                 )
@@ -628,14 +845,12 @@ def main() -> int:
             _check_and_update_for_early_style_check(result)
         if pr_info.has_changes_in_documentation_only():
             _update_config_for_docs_only(result)
+    ### CONFIGURE action: start
 
-    elif args.update_gh_statuses:
-        assert indata, "Run config must be provided via --infile"
-        _update_gh_statuses(indata=indata, s3=s3)
-
+    ### PRE action: start
     elif args.pre:
-        # remove job status file if any
         CommitStatusData.cleanup()
+        JobReport.cleanup()
 
         if is_test_job(args.job_name):
             assert indata, "Run config must be provided via --infile"
@@ -653,7 +868,9 @@ def main() -> int:
             )
         else:
             print(f"Pre action done. Nothing to do for [{args.job_name}]")
+    ### PRE action: end
 
+    ### RUN action: start
     elif args.run:
         assert CI_CONFIG.get_job_config(
             args.job_name
@@ -684,26 +901,89 @@ def main() -> int:
                 f"Run action failed for: [{args.job_name}] with exit code [{process.returncode}]"
             )
             exit_code = process.returncode
+    ### RUN action: end
 
+    ### POST action: start
     elif args.post:
-        if is_build_job(args.job_name):
-            report_path = Path(TEMP_PATH)  # build-check.py stores report in TEMP_PATH
-            assert report_path.is_dir(), f"File [{report_path}] is not a dir"
-            files = list(report_path.glob(f"*{args.job_name}.json"))  # type: ignore[arg-type]
-            assert len(files) == 1, f"Which is the report file: {files}?"
-            local_report = f"{files[0]}"
-            report_name = BuildResult.get_report_name(args.job_name)
-            assert indata
-            s3_path = Path(get_s3_path(indata["build"])) / report_name
-            report_url = s3.upload_file(
-                bucket=S3_BUILDS_BUCKET, file_path=local_report, s3_path=s3_path
+        assert indata
+        ch_helper = ClickHouseHelper()
+        job_report = JobReport.load() if JobReport.exist() else None
+        s3_path_prefix = "/".join(
+            (
+                get_release_or_pr(pr_info, get_version_from_repo())[0],
+                pr_info.sha,
+                CI_CONFIG.normalize_string(args.job_name),
             )
-            print(
-                f"Post action done. Report file [{local_report}] has been uploaded to [{report_url}]"
-            )
-        else:
-            print(f"Post action done. Nothing to do for [{args.job_name}]")
+        )
 
+        check_url = None
+        if is_build_job(args.job_name):
+            assert job_report, "Job Report must be present for a build job"
+            build_name = args.job_name
+            log_url = _upload_build_artifacts(
+                pr_info,
+                build_name,
+                build_digest=indata["build"],
+                job_report=job_report,
+                s3=s3,
+                s3_destination=s3_path_prefix,
+            )
+            _upload_build_profile_data(
+                pr_info, build_name, job_report, git_runner, ch_helper
+            )
+            check_url = log_url
+        else:
+            # FIXME: switch all jobs to job report and remove this if
+            if job_report:
+                additional_urls = []
+                if job_report.dir_for_upload:
+                    additional_urls = s3.upload_build_directory_to_s3(
+                        Path(job_report.dir_for_upload),
+                        s3_path_prefix,
+                        keep_dirs_in_s3_path=False,
+                        upload_symlinks=False,
+                    )
+
+                check_url = upload_result_helper.upload_results(
+                    s3,
+                    pr_info.number,
+                    pr_info.sha,
+                    job_report.test_results,
+                    job_report.additional_files,
+                    args.job_name,
+                    additional_urls=additional_urls or None,
+                )
+                commit = get_commit(
+                    Github(get_best_robot_token(), per_page=100), pr_info.sha
+                )
+                post_commit_status(
+                    commit,
+                    job_report.status,
+                    check_url,
+                    format_description(job_report.description),
+                    args.job_name,
+                    pr_info,
+                    dump_to_file=True,
+                )
+
+        if job_report:
+            assert check_url
+            print(f"Job report url: {check_url}")
+            prepared_events = prepare_tests_results_for_clickhouse(
+                pr_info,
+                job_report.test_results,
+                job_report.status,
+                job_report.duration,
+                job_report.start_time,
+                check_url,
+                args.job_name,
+            )
+            ch_helper.insert_events_into(
+                db="default", table="checks", events=prepared_events
+            )
+    ### POST action: end
+
+    ### MARK SUCCESS action: start
     elif args.mark_success:
         assert indata, "Run config must be provided via --infile"
         job = args.job_name
@@ -756,8 +1036,13 @@ def main() -> int:
             )
         else:
             print(f"Job [{job}] is not ok, status [{job_status.status}]")
+    ### MARK SUCCESS action: end
 
-    # print results
+    elif args.update_gh_statuses:
+        assert indata, "Run config must be provided via --infile"
+        _update_gh_statuses(indata=indata, s3=s3)
+
+    ### print results
     if args.outfile:
         with open(args.outfile, "w") as f:
             if isinstance(result, str):
